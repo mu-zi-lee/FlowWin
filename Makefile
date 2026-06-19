@@ -5,7 +5,7 @@ BUILD_DIR := .build
 BIN_DIR := $(BUILD_DIR)/release
 BIN := $(BIN_DIR)/$(APP_NAME)
 
-CFLAGS := -fobjc-arc -ObjC -Wall -Wextra -Wno-deprecated-declarations -mmacosx-version-min=12.3
+CFLAGS := -O2 -fobjc-arc -ObjC -Wall -Wextra -Wno-deprecated-declarations -mmacosx-version-min=12.3
 FRAMEWORKS := -framework Cocoa -framework CoreGraphics -framework ApplicationServices -framework QuartzCore -framework Carbon -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo -framework CoreImage
 
 .PHONY: all run check clean app
