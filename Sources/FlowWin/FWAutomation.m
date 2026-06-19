@@ -1,5 +1,7 @@
 #import "FWAutomation.h"
 
+static NSTimeInterval const FWAutomationResponseTimeout = 1.0;
+
 void FWPrintAutomationUsage(void) {
     printf("FlowWin automation commands:\n");
     printf("  FlowWin --pin-frontmost\n");
@@ -81,6 +83,12 @@ int FWPostAutomationCommand(NSString *command, NSDictionary *userInfo) {
         close(socketFD);
         return 3;
     }
+
+    struct timeval timeout;
+    timeout.tv_sec = (time_t)FWAutomationResponseTimeout;
+    timeout.tv_usec = (suseconds_t)((FWAutomationResponseTimeout - timeout.tv_sec) * 1000000.0);
+    setsockopt(socketFD, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(socketFD, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
     if (!FWWriteAllToFileDescriptor(socketFD, payloadData.bytes, payloadData.length)) {
         fprintf(stderr, "failed to send automation command: %s\n", strerror(errno));
@@ -171,4 +179,3 @@ int FWRunAutomationCLI(int argc, const char *argv[]) {
 
     return -1;
 }
-

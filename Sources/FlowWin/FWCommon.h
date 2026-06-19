@@ -12,6 +12,7 @@
 #import <limits.h>
 #import <math.h>
 #import <sys/socket.h>
+#import <sys/time.h>
 #import <sys/un.h>
 #import <unistd.h>
 
@@ -21,6 +22,11 @@ extern CGFloat const FWOpacityPreciseScrollScale;
 extern CGFloat const FWOpacityPreciseScrollMaxDelta;
 extern CGFloat const FWSourceWindowParkingMargin;
 extern NSTimeInterval const FWBackdropRefreshInterval;
+extern NSTimeInterval const FWMirrorInteractiveRefreshInterval;
+extern NSTimeInterval const FWMirrorStreamRefreshInterval;
+extern NSTimeInterval const FWMirrorFallbackRefreshInterval;
+extern int32_t const FWStreamTargetFrameRate;
+extern CGFloat const FWStreamMaxPixelArea;
 extern NSInteger const FWBackdropWindowLevelOffset;
 extern UInt32 const FWHotKeyToggleFrontmostID;
 extern UInt32 const FWHotKeyCloseAllID;

@@ -232,7 +232,6 @@
 @property(nonatomic, strong) NSTimer *timer;
 @property(nonatomic, strong) NSTimer *autoUnpinTimer;
 @property(nonatomic, strong) NSTimer *backdropRefreshTimer;
-@property(nonatomic, strong) NSTimer *backdropWarmupTimer;
 @property(nonatomic, strong) NSDate *autoUnpinDeadline;
 @property(nonatomic, strong) SCStream *captureStream;
 @property(nonatomic, strong) dispatch_queue_t captureQueue;
@@ -241,11 +240,14 @@
 @property(nonatomic, assign) BOOL streamCaptureStarting;
 @property(nonatomic, assign) BOOL streamConfigurationUpdating;
 @property(nonatomic, assign) BOOL needsStreamConfigurationUpdate;
+@property(nonatomic, assign) BOOL streamFrameDisplayPending;
 @property(nonatomic, assign) NSSize streamConfigurationSize;
+@property(nonatomic, assign) NSTimeInterval refreshInterval;
 @property(nonatomic, assign) NSTimeInterval autoUnpinInterval;
 @property(nonatomic, assign) NSRect sourceFrame;
 @property(nonatomic, assign) CGRect sourceQuartzBounds;
 @property(nonatomic, assign) AXUIElementRef sourceAXWindow;
+@property(nonatomic, assign) CGImageRef cachedSourceMaskImage;
 @property(nonatomic, assign) BOOL sourceWindowParked;
 @property(nonatomic, assign) BOOL sourceRestoreFrameValid;
 @property(nonatomic, assign) CGPoint sourceRestorePosition;
@@ -259,18 +261,97 @@
 - (void)stopStreamCapture;
 - (void)restartStreamCapture;
 - (void)updateStreamCaptureConfigurationForSize:(NSSize)size;
+- (BOOL)beginStreamFrameDisplayIfPossible;
+- (void)finishStreamFrameDisplay;
+- (NSTimeInterval)desiredRefreshInterval;
+- (void)updateRefreshTimerIfNeeded;
 - (void)parkSourceWindowIfPossible;
 - (void)enforceSourceWindowParkingIfNeededWithBounds:(CGRect)updatedQuartzBounds;
 - (void)restoreSourceWindowIfNeeded;
 - (void)releaseSourceAXWindow;
 - (BOOL)moveSourceWindowToPinnedFrame;
 - (void)updateNativeControlFramesFromSourceBounds:(CGRect)sourceBounds;
-- (void)startBackdropWarmupIfNeeded;
 - (void)refreshBackdropImage;
 - (NSImage *)maskedBackdropImageWithBackground:(NSImage *)backgroundImage;
 - (CGImageRef)newSourceMaskImage;
+- (CGImageRef)copySourceMaskImage;
+- (void)invalidateSourceMaskImage;
 - (NSImage *)captureBackdropImageBehindWindowNumber:(CGWindowID)windowNumber frame:(NSRect)frame;
 @end
+
+typedef struct {
+    NSUInteger count;
+    CFTimeInterval totalDuration;
+} FWPerfMetric;
+
+static FWPerfMetric FWPerfRefreshMetric = {0, 0};
+static FWPerfMetric FWPerfFallbackCaptureMetric = {0, 0};
+static FWPerfMetric FWPerfStreamFrameMetric = {0, 0};
+static FWPerfMetric FWPerfBackdropMetric = {0, 0};
+static FWPerfMetric FWPerfNativeControlMetric = {0, 0};
+static CFTimeInterval FWPerfLastReportTime = 0;
+
+static BOOL FWPerfEnabled(void) {
+    static BOOL initialized = NO;
+    static BOOL enabled = NO;
+    if (!initialized) {
+        NSString *value = NSProcessInfo.processInfo.environment[@"FLOWWIN_PERF"];
+        enabled = value.length > 0 && ![value isEqualToString:@"0"];
+        initialized = YES;
+    }
+    return enabled;
+}
+
+static void FWPerfResetMetrics(void) {
+    FWPerfRefreshMetric = (FWPerfMetric){0, 0};
+    FWPerfFallbackCaptureMetric = (FWPerfMetric){0, 0};
+    FWPerfStreamFrameMetric = (FWPerfMetric){0, 0};
+    FWPerfBackdropMetric = (FWPerfMetric){0, 0};
+    FWPerfNativeControlMetric = (FWPerfMetric){0, 0};
+}
+
+static double FWPerfAverageMilliseconds(FWPerfMetric metric) {
+    return metric.count == 0 ? 0 : (metric.totalDuration / (double)metric.count) * 1000.0;
+}
+
+static void FWPerfReportIfNeeded(CFTimeInterval now) {
+    if (FWPerfLastReportTime <= 0) {
+        FWPerfLastReportTime = now;
+        return;
+    }
+
+    CFTimeInterval elapsed = now - FWPerfLastReportTime;
+    if (elapsed < 5.0) {
+        return;
+    }
+
+    double streamFPS = elapsed > 0 ? (double)FWPerfStreamFrameMetric.count / elapsed : 0;
+    NSLog(@"FlowWin perf: refresh=%lu avg=%.2fms fallback=%lu avg=%.2fms stream=%.1ffps backdrop=%lu avg=%.2fms native=%lu avg=%.2fms",
+          (unsigned long)FWPerfRefreshMetric.count,
+          FWPerfAverageMilliseconds(FWPerfRefreshMetric),
+          (unsigned long)FWPerfFallbackCaptureMetric.count,
+          FWPerfAverageMilliseconds(FWPerfFallbackCaptureMetric),
+          streamFPS,
+          (unsigned long)FWPerfBackdropMetric.count,
+          FWPerfAverageMilliseconds(FWPerfBackdropMetric),
+          (unsigned long)FWPerfNativeControlMetric.count,
+          FWPerfAverageMilliseconds(FWPerfNativeControlMetric));
+    FWPerfResetMetrics();
+    FWPerfLastReportTime = now;
+}
+
+static void FWPerfRecord(FWPerfMetric *metric, CFTimeInterval duration) {
+    if (!FWPerfEnabled()) {
+        return;
+    }
+
+    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+    @synchronized (FWMirrorController.class) {
+        metric->count += 1;
+        metric->totalDuration += duration;
+        FWPerfReportIfNeeded(now);
+    }
+}
 
 @implementation FWMirrorController
 
@@ -305,8 +386,6 @@
     [self configureWindow];
     [self startStreamCapture];
     [self parkSourceWindowIfPossible];
-    [self startBackdropWarmupIfNeeded];
-    [self refresh];
     [self startRefreshing];
     return self;
 }
@@ -381,22 +460,56 @@
 
 #pragma mark - Refresh
 
+- (NSTimeInterval)desiredRefreshInterval {
+    if (self.nativeControlActive) {
+        return FWMirrorInteractiveRefreshInterval;
+    }
+    if (self.streamCaptureActive || self.streamCaptureStarting) {
+        return FWMirrorStreamRefreshInterval;
+    }
+    return FWMirrorFallbackRefreshInterval;
+}
+
 - (void)startRefreshing {
     [self refresh];
     __weak typeof(self) weakSelf = self;
-    self.timer = [NSTimer timerWithTimeInterval:(1.0 / 12.0)
+    self.refreshInterval = [self desiredRefreshInterval];
+    self.timer = [NSTimer timerWithTimeInterval:self.refreshInterval
                                         repeats:YES
                                           block:^(NSTimer *timer) {
         (void)timer;
         [weakSelf refresh];
     }];
-    self.timer.tolerance = 0.02;
+    self.timer.tolerance = self.refreshInterval >= 0.5 ? 0.1 : 0.02;
+    [NSRunLoop.mainRunLoop addTimer:self.timer forMode:NSRunLoopCommonModes];
+}
+
+- (void)updateRefreshTimerIfNeeded {
+    NSTimeInterval desiredInterval = [self desiredRefreshInterval];
+    if (self.timer && fabs(self.refreshInterval - desiredInterval) < 0.001) {
+        return;
+    }
+
+    [self.timer invalidate];
+    self.timer = nil;
+    self.refreshInterval = desiredInterval;
+
+    __weak typeof(self) weakSelf = self;
+    self.timer = [NSTimer timerWithTimeInterval:desiredInterval
+                                        repeats:YES
+                                          block:^(NSTimer *timer) {
+        (void)timer;
+        [weakSelf refresh];
+    }];
+    self.timer.tolerance = desiredInterval >= 0.5 ? 0.1 : 0.02;
     [NSRunLoop.mainRunLoop addTimer:self.timer forMode:NSRunLoopCommonModes];
 }
 
 - (void)refresh {
+    CFTimeInterval refreshStart = FWPerfEnabled() ? CFAbsoluteTimeGetCurrent() : 0;
     FWWindowInfo *updatedInfo = [FWWindowLister windowWithID:self.windowID];
     if (!updatedInfo) {
+        FWPerfRecord(&FWPerfRefreshMetric, refreshStart > 0 ? CFAbsoluteTimeGetCurrent() - refreshStart : 0);
         [self.delegate mirrorControllerDidLoseSourceWindow:self];
         return;
     }
@@ -405,8 +518,6 @@
     if (!self.nativeControlActive && !self.movingPinnedWindow && !NSEqualRects(self.window.frame, self.pinnedFrame)) {
         [self.window setFrame:self.pinnedFrame display:YES];
     }
-
-    [self.chromeView setNeedsDisplay:YES];
 
     CGRect updatedQuartzBounds = updatedInfo.quartzBounds;
     if (self.nativeControlActive) {
@@ -432,21 +543,26 @@
     self.sourceFrame = self.pinnedFrame;
     [self updateWindowInteraction];
 
-    if (self.streamCaptureActive) {
+    if (self.streamCaptureActive || self.streamCaptureStarting) {
+        [self updateRefreshTimerIfNeeded];
+        FWPerfRecord(&FWPerfRefreshMetric, refreshStart > 0 ? CFAbsoluteTimeGetCurrent() - refreshStart : 0);
         return;
     }
 
+    CFTimeInterval fallbackStart = FWPerfEnabled() ? CFAbsoluteTimeGetCurrent() : 0;
     CGImageRef sourceImage = CGWindowListCreateImage(
         CGRectNull,
         kCGWindowListOptionIncludingWindow,
         self.windowID,
         kCGWindowImageBoundsIgnoreFraming | kCGWindowImageNominalResolution
     );
+    FWPerfRecord(&FWPerfFallbackCaptureMetric, fallbackStart > 0 ? CFAbsoluteTimeGetCurrent() - fallbackStart : 0);
 
     if (!sourceImage) {
         if (!self.imageView.image) {
             self.placeholderLabel.hidden = NO;
         }
+        FWPerfRecord(&FWPerfRefreshMetric, refreshStart > 0 ? CFAbsoluteTimeGetCurrent() - refreshStart : 0);
         return;
     }
 
@@ -456,6 +572,7 @@
                          imageHeight + 2 >= (size_t)ceil(MAX(1.0, updatedHeight));
     if (!looksComplete && self.imageView.image) {
         CGImageRelease(sourceImage);
+        FWPerfRecord(&FWPerfRefreshMetric, refreshStart > 0 ? CFAbsoluteTimeGetCurrent() - refreshStart : 0);
         return;
     }
 
@@ -464,6 +581,8 @@
                                                 size:self.pinnedFrame.size];
     self.imageView.image = image;
     CGImageRelease(sourceImage);
+    [self updateRefreshTimerIfNeeded];
+    FWPerfRecord(&FWPerfRefreshMetric, refreshStart > 0 ? CFAbsoluteTimeGetCurrent() - refreshStart : 0);
 }
 
 - (void)setMirrorOpacity:(CGFloat)opacity {
@@ -489,10 +608,19 @@
 - (SCStreamConfiguration *)streamConfigurationForSize:(NSSize)size {
     SCStreamConfiguration *configuration = [SCStreamConfiguration new];
     CGFloat scale = [self backingScaleFactorForPinnedFrame];
-    configuration.width = (size_t)MAX(1.0, ceil(size.width * scale));
-    configuration.height = (size_t)MAX(1.0, ceil(size.height * scale));
+    CGFloat pixelWidth = MAX(1.0, ceil(size.width * scale));
+    CGFloat pixelHeight = MAX(1.0, ceil(size.height * scale));
+    CGFloat pixelArea = pixelWidth * pixelHeight;
+    if (pixelArea > FWStreamMaxPixelArea) {
+        CGFloat areaScale = sqrt(FWStreamMaxPixelArea / pixelArea);
+        pixelWidth = MAX(1.0, floor(pixelWidth * areaScale));
+        pixelHeight = MAX(1.0, floor(pixelHeight * areaScale));
+    }
+
+    configuration.width = (size_t)pixelWidth;
+    configuration.height = (size_t)pixelHeight;
     configuration.pixelFormat = kCVPixelFormatType_32BGRA;
-    configuration.minimumFrameInterval = CMTimeMake(1, 30);
+    configuration.minimumFrameInterval = CMTimeMake(1, FWStreamTargetFrameRate);
     configuration.queueDepth = 3;
     configuration.showsCursor = NO;
     configuration.scalesToFit = YES;
@@ -521,6 +649,7 @@
             if (error || !shareableContent) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     mirror.streamCaptureStarting = NO;
+                    [mirror updateRefreshTimerIfNeeded];
                 });
                 return;
             }
@@ -536,6 +665,7 @@
             if (!targetWindow) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     mirror.streamCaptureStarting = NO;
+                    [mirror updateRefreshTimerIfNeeded];
                 });
                 return;
             }
@@ -549,6 +679,7 @@
             if (![stream addStreamOutput:mirror type:SCStreamOutputTypeScreen sampleHandlerQueue:mirror.captureQueue error:&outputError]) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     mirror.streamCaptureStarting = NO;
+                    [mirror updateRefreshTimerIfNeeded];
                 });
                 return;
             }
@@ -566,6 +697,7 @@
                             mirror.streamConfigurationSize = captureSize;
                             [mirror updateStreamCaptureConfigurationForSize:mirror.pinnedFrame.size];
                         }
+                        [mirror updateRefreshTimerIfNeeded];
                     });
                 }];
             });
@@ -580,6 +712,7 @@
     self.streamCaptureStarting = NO;
     self.streamConfigurationUpdating = NO;
     self.needsStreamConfigurationUpdate = NO;
+    [self finishStreamFrameDisplay];
     self.streamConfigurationSize = NSZeroSize;
     if (stream) {
         [stream stopCaptureWithCompletionHandler:nil];
@@ -630,7 +763,24 @@
     }];
 }
 
+- (BOOL)beginStreamFrameDisplayIfPossible {
+    @synchronized (self) {
+        if (self.streamFrameDisplayPending) {
+            return NO;
+        }
+        self.streamFrameDisplayPending = YES;
+        return YES;
+    }
+}
+
+- (void)finishStreamFrameDisplay {
+    @synchronized (self) {
+        self.streamFrameDisplayPending = NO;
+    }
+}
+
 - (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer ofType:(SCStreamOutputType)type {
+    CFTimeInterval frameStart = FWPerfEnabled() ? CFAbsoluteTimeGetCurrent() : 0;
     if (type != SCStreamOutputTypeScreen || !sampleBuffer || !CMSampleBufferIsValid(sampleBuffer)) {
         return;
     }
@@ -644,26 +794,35 @@
         }
     }
 
+    if (![self beginStreamFrameDisplayIfPossible]) {
+        return;
+    }
+
     CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!imageBuffer) {
+        [self finishStreamFrameDisplay];
         return;
     }
 
     CIImage *ciImage = [CIImage imageWithCVImageBuffer:imageBuffer];
     if (!ciImage) {
+        [self finishStreamFrameDisplay];
         return;
     }
 
     CGImageRef cgImage = [self.ciContext createCGImage:ciImage fromRect:ciImage.extent];
     if (!cgImage) {
+        [self finishStreamFrameDisplay];
         return;
     }
+    FWPerfRecord(&FWPerfStreamFrameMetric, frameStart > 0 ? CFAbsoluteTimeGetCurrent() - frameStart : 0);
 
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
         FWMirrorController *mirror = weakSelf;
         if (!mirror || mirror.captureStream != stream) {
             CGImageRelease(cgImage);
+            [mirror finishStreamFrameDisplay];
             return;
         }
 
@@ -671,6 +830,7 @@
         NSImage *image = [[NSImage alloc] initWithCGImage:cgImage size:mirror.pinnedFrame.size];
         mirror.imageView.image = image;
         CGImageRelease(cgImage);
+        [mirror finishStreamFrameDisplay];
     });
 }
 
@@ -681,6 +841,7 @@
             self.captureStream = nil;
             self.streamCaptureActive = NO;
             self.streamCaptureStarting = NO;
+            [self updateRefreshTimerIfNeeded];
         }
     });
 }
@@ -764,11 +925,17 @@
 
 - (void)updateWindowInteraction {
     BOOL modifierActive = self.modifierOperateActive || self.modifierMoveActive;
-    self.attachedToSource = !self.sourceWindowParked;
-    self.window.ignoresMouseEvents = self.nativeControlActive || (!modifierActive && self.clickThrough);
+    BOOL nextAttachedToSource = !self.sourceWindowParked;
+    BOOL nextIgnoresMouseEvents = self.nativeControlActive || (!modifierActive && self.clickThrough);
+    BOOL interactionChanged = self.attachedToSource != nextAttachedToSource ||
+                              self.window.ignoresMouseEvents != nextIgnoresMouseEvents;
+
+    self.attachedToSource = nextAttachedToSource;
+    self.window.ignoresMouseEvents = nextIgnoresMouseEvents;
     self.window.hasShadow = NO;
-    [self.mirrorContentView setNeedsDisplay:YES];
-    [self.chromeView setNeedsDisplay:YES];
+    if (interactionChanged) {
+        [self.chromeView setNeedsDisplay:YES];
+    }
 }
 
 #pragma mark - Source Window Placement
@@ -907,6 +1074,7 @@
         [self.window setFrame:self.pinnedFrame display:YES];
         [self.backdropWindow setFrame:self.pinnedFrame display:YES];
         if (sizeChanged) {
+            [self invalidateSourceMaskImage];
             [self updateStreamCaptureConfigurationForSize:self.pinnedFrame.size];
         }
     }
@@ -932,6 +1100,7 @@
 }
 
 - (void)refreshBackdropImage {
+    CFTimeInterval backdropStart = FWPerfEnabled() ? CFAbsoluteTimeGetCurrent() : 0;
     if (!self.backdropWindow || !self.backdropImageView) {
         return;
     }
@@ -943,6 +1112,7 @@
     if (image) {
         self.backdropImageView.image = [self maskedBackdropImageWithBackground:image] ?: image;
     }
+    FWPerfRecord(&FWPerfBackdropMetric, backdropStart > 0 ? CFAbsoluteTimeGetCurrent() - backdropStart : 0);
 }
 
 - (CGImageRef)newSourceMaskImage {
@@ -951,6 +1121,27 @@
                                                   self.windowID,
                                                   kCGWindowImageBoundsIgnoreFraming | kCGWindowImageNominalResolution);
     return imageRef;
+}
+
+- (CGImageRef)copySourceMaskImage {
+    if (self.nativeControlActive && self.cachedSourceMaskImage) {
+        return CGImageRetain(self.cachedSourceMaskImage);
+    }
+
+    CGImageRef imageRef = [self newSourceMaskImage];
+    if (self.nativeControlActive && imageRef) {
+        [self invalidateSourceMaskImage];
+        self.cachedSourceMaskImage = CGImageRetain(imageRef);
+    }
+    return imageRef;
+}
+
+- (void)invalidateSourceMaskImage {
+    if (!self.cachedSourceMaskImage) {
+        return;
+    }
+    CGImageRelease(self.cachedSourceMaskImage);
+    self.cachedSourceMaskImage = NULL;
 }
 
 - (NSImage *)maskedBackdropImageWithBackground:(NSImage *)backgroundImage {
@@ -966,7 +1157,7 @@
         return nil;
     }
 
-    CGImageRef maskRef = [self newSourceMaskImage];
+    CGImageRef maskRef = [self copySourceMaskImage];
     if (!maskRef) {
         return nil;
     }
@@ -1002,29 +1193,10 @@
     return maskedImage;
 }
 
-- (void)startBackdropWarmupIfNeeded {
-    if (self.backdropWarmupTimer) {
-        return;
-    }
-
-    [self configureBackdropWindowIfNeeded];
-    [self.backdropWindow setFrame:self.pinnedFrame display:YES];
-    [self refreshBackdropImage];
-
-    __weak typeof(self) weakSelf = self;
-    self.backdropWarmupTimer = [NSTimer timerWithTimeInterval:FWBackdropRefreshInterval
-                                                      repeats:YES
-                                                        block:^(NSTimer *timer) {
-        (void)timer;
-        [weakSelf refreshBackdropImage];
-    }];
-    self.backdropWarmupTimer.tolerance = 0.01;
-    [NSRunLoop.mainRunLoop addTimer:self.backdropWarmupTimer forMode:NSRunLoopCommonModes];
-}
-
 #pragma mark - Native Control
 
 - (BOOL)beginNativeControlModeIfMouseInside:(NSPoint)mouseLocation {
+    CFTimeInterval nativeControlStart = FWPerfEnabled() ? CFAbsoluteTimeGetCurrent() : 0;
     if (self.nativeControlActive) {
         return YES;
     }
@@ -1035,10 +1207,10 @@
         return NO;
     }
 
-    [self.backdropWarmupTimer invalidate];
-    self.backdropWarmupTimer = nil;
     [self configureBackdropWindowIfNeeded];
+    [self invalidateSourceMaskImage];
     [self.backdropWindow setFrame:self.pinnedFrame display:YES];
+    [self refreshBackdropImage];
     [self.backdropWindow orderFrontRegardless];
     [self.window orderFrontRegardless];
 
@@ -1053,6 +1225,7 @@
     NSRunningApplication *application = [NSRunningApplication runningApplicationWithProcessIdentifier:self.ownerPID];
     [application activateWithOptions:NSApplicationActivateIgnoringOtherApps];
     [self updateWindowInteraction];
+    [self updateRefreshTimerIfNeeded];
 
     __weak typeof(self) weakSelf = self;
     self.backdropRefreshTimer = [NSTimer timerWithTimeInterval:FWBackdropRefreshInterval
@@ -1061,8 +1234,9 @@
         (void)timer;
         [weakSelf refreshBackdropImage];
     }];
-    self.backdropRefreshTimer.tolerance = 0.04;
+    self.backdropRefreshTimer.tolerance = 0.015;
     [NSRunLoop.mainRunLoop addTimer:self.backdropRefreshTimer forMode:NSRunLoopCommonModes];
+    FWPerfRecord(&FWPerfNativeControlMetric, nativeControlStart > 0 ? CFAbsoluteTimeGetCurrent() - nativeControlStart : 0);
     return YES;
 }
 
@@ -1139,8 +1313,9 @@
     }
 
     [self.backdropWindow orderOut:nil];
-    [self startBackdropWarmupIfNeeded];
+    [self invalidateSourceMaskImage];
     [self updateWindowInteraction];
+    [self updateRefreshTimerIfNeeded];
 }
 
 - (void)releaseSourceAXWindow {
@@ -1315,11 +1490,10 @@
     self.autoUnpinDeadline = nil;
     [self.backdropRefreshTimer invalidate];
     self.backdropRefreshTimer = nil;
-    [self.backdropWarmupTimer invalidate];
-    self.backdropWarmupTimer = nil;
     [self.window orderOut:nil];
     [self.backdropWindow orderOut:nil];
     [self restoreSourceWindowIfNeeded];
     [self releaseSourceAXWindow];
+    [self invalidateSourceMaskImage];
 }
 @end

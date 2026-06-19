@@ -14,6 +14,7 @@
 @property(nonatomic, assign) BOOL closeAllHotKeyRegistered;
 @property(nonatomic, assign) int automationSocketFD;
 @property(nonatomic, strong) dispatch_source_t automationSocketSource;
+@property(nonatomic, strong) dispatch_queue_t automationQueue;
 @property(nonatomic, strong) id localFlagsMonitor;
 @property(nonatomic, strong) id localMouseMonitor;
 @property(nonatomic, strong) id globalFlagsMonitor;
@@ -23,12 +24,18 @@
 @property(nonatomic, assign) BOOL commandModifierActive;
 @property(nonatomic, assign) CGFloat globalOpacity;
 @property(nonatomic, assign) BOOL opacityMenuRefreshScheduled;
+@property(nonatomic, copy) NSArray<FWWindowInfo *> *cachedMenuWindows;
+@property(nonatomic, strong) NSDate *cachedMenuWindowsDate;
 - (void)startFlowWin;
 - (void)pinFrontmostWindow:(id)sender;
 - (void)toggleFrontmostWindow:(id)sender;
 - (void)closeAllMirrors:(id)sender;
 - (void)applyGlobalOpacity:(CGFloat)opacity scheduleMenuRefresh:(BOOL)scheduleMenuRefresh;
 - (void)scheduleOpacityMenuRefresh;
+- (void)mirrorCollectionDidChange;
+- (NSArray<FWWindowInfo *> *)menuWindowsRefreshing:(BOOL)refresh;
+- (void)invalidateMenuWindowsCache;
+- (BOOL)performAutomationCommandOnMainThread:(NSString *)command userInfo:(NSDictionary *)userInfo;
 - (BOOL)performAutomationCommand:(NSString *)command userInfo:(NSDictionary *)userInfo;
 @end
 
@@ -58,6 +65,21 @@ static OSStatus FWHandleHotKey(EventHandlerCallRef nextHandler, EventRef event, 
     return eventNotHandledErr;
 }
 
+static NSUInteger const FWAutomationMaxRequestBytes = 64 * 1024;
+static NSTimeInterval const FWAutomationClientTimeout = 0.25;
+
+static void FWWriteAutomationOKResponseAndClose(int clientFD, BOOL ok) {
+    NSDictionary *response = @{@"ok": @(ok)};
+    NSData *responseData = [NSPropertyListSerialization dataWithPropertyList:response
+                                                                      format:NSPropertyListBinaryFormat_v1_0
+                                                                     options:0
+                                                                       error:nil];
+    if (responseData) {
+        FWWriteAllToFileDescriptor(clientFD, responseData.bytes, responseData.length);
+    }
+    close(clientFD);
+}
+
 @implementation FWAppDelegate
 
 #pragma mark - Application Lifecycle
@@ -78,7 +100,6 @@ static OSStatus FWHandleHotKey(EventHandlerCallRef nextHandler, EventRef event, 
     self.statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
     self.statusItem.button.title = @"FlowWin";
     [self registerGlobalHotKeys];
-    [self registerModifierMonitors];
     [self registerAutomationHandlers];
     [self rebuildMenu];
 }
@@ -176,10 +197,11 @@ static OSStatus FWHandleHotKey(EventHandlerCallRef nextHandler, EventRef event, 
 
     self.automationSocketFD = socketFD;
     NSLog(@"FlowWin: automation listener ready at %@", socketPath);
+    self.automationQueue = dispatch_queue_create("local.flowwin.automation", DISPATCH_QUEUE_SERIAL);
     self.automationSocketSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ,
                                                          (uintptr_t)socketFD,
                                                          0,
-                                                         dispatch_get_main_queue());
+                                                         self.automationQueue);
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(self.automationSocketSource, ^{
         [weakSelf acceptAutomationConnections];
@@ -201,10 +223,12 @@ static OSStatus FWHandleHotKey(EventHandlerCallRef nextHandler, EventRef event, 
         dispatch_source_cancel(self.automationSocketSource);
         self.automationSocketSource = nil;
         self.automationSocketFD = -1;
+        self.automationQueue = nil;
     } else if (self.automationSocketFD >= 0) {
         close(self.automationSocketFD);
         self.automationSocketFD = -1;
         unlink(FWAutomationSocketPath().fileSystemRepresentation);
+        self.automationQueue = nil;
     }
 
     [[NSAppleEventManager sharedAppleEventManager] removeEventHandlerForEventClass:kInternetEventClass
@@ -226,12 +250,23 @@ static OSStatus FWHandleHotKey(EventHandlerCallRef nextHandler, EventRef event, 
 }
 
 - (void)handleAutomationClient:(int)clientFD {
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = (suseconds_t)(FWAutomationClientTimeout * 1000000.0);
+    setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(clientFD, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
     NSMutableData *requestData = [NSMutableData data];
     uint8_t buffer[4096];
     for (;;) {
         ssize_t count = read(clientFD, buffer, sizeof(buffer));
         if (count > 0) {
             [requestData appendBytes:buffer length:(NSUInteger)count];
+            if (requestData.length > FWAutomationMaxRequestBytes) {
+                NSLog(@"FlowWin: automation command exceeded %lu bytes", (unsigned long)FWAutomationMaxRequestBytes);
+                FWWriteAutomationOKResponseAndClose(clientFD, NO);
+                return;
+            }
             continue;
         }
         if (count == 0) {
@@ -239,6 +274,10 @@ static OSStatus FWHandleHotKey(EventHandlerCallRef nextHandler, EventRef event, 
         }
         if (errno == EINTR) {
             continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            FWWriteAutomationOKResponseAndClose(clientFD, NO);
+            return;
         }
         NSLog(@"FlowWin: failed to read automation command (%s)", strerror(errno));
         close(clientFD);
@@ -250,16 +289,8 @@ static OSStatus FWHandleHotKey(EventHandlerCallRef nextHandler, EventRef event, 
                                                                        format:nil
                                                                         error:nil];
     NSString *command = [payload isKindOfClass:NSDictionary.class] ? payload[FWAutomationCommandKey] : nil;
-    BOOL ok = [command isKindOfClass:NSString.class] && [self performAutomationCommand:command userInfo:payload];
-    NSDictionary *response = @{@"ok": @(ok)};
-    NSData *responseData = [NSPropertyListSerialization dataWithPropertyList:response
-                                                                      format:NSPropertyListBinaryFormat_v1_0
-                                                                     options:0
-                                                                       error:nil];
-    if (responseData) {
-        FWWriteAllToFileDescriptor(clientFD, responseData.bytes, responseData.length);
-    }
-    close(clientFD);
+    BOOL ok = [command isKindOfClass:NSString.class] && [self performAutomationCommandOnMainThread:command userInfo:payload];
+    FWWriteAutomationOKResponseAndClose(clientFD, ok);
 }
 
 - (void)unregisterGlobalHotKeys {
@@ -280,6 +311,10 @@ static OSStatus FWHandleHotKey(EventHandlerCallRef nextHandler, EventRef event, 
 #pragma mark - Global Input Monitors
 
 - (void)registerModifierMonitors {
+    if (self.localFlagsMonitor || self.localMouseMonitor || self.globalFlagsMonitor || self.globalMouseMonitor) {
+        return;
+    }
+
     __weak typeof(self) weakSelf = self;
     self.localFlagsMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskFlagsChanged
                                                                    handler:^NSEvent *(NSEvent *event) {
@@ -326,6 +361,15 @@ static OSStatus FWHandleHotKey(EventHandlerCallRef nextHandler, EventRef event, 
     }
     self.optionMovingMirror = nil;
     self.commandHoldMirror = nil;
+}
+
+- (void)mirrorCollectionDidChange {
+    if (self.mirrors.count > 0) {
+        [self registerModifierMonitors];
+        return;
+    }
+
+    [self unregisterModifierMonitors];
 }
 
 - (void)updateModifierOperateStateFromFlags:(NSEventModifierFlags)flags {
@@ -408,8 +452,39 @@ static OSStatus FWHandleHotKey(EventHandlerCallRef nextHandler, EventRef event, 
 
 #pragma mark - Menu
 
+- (NSArray<FWWindowInfo *> *)menuWindowsRefreshing:(BOOL)refresh {
+    static NSTimeInterval const FWMenuWindowsCacheLifetime = 2.0;
+    if (!refresh && self.cachedMenuWindows && self.cachedMenuWindowsDate &&
+        fabs(self.cachedMenuWindowsDate.timeIntervalSinceNow) < FWMenuWindowsCacheLifetime) {
+        return self.cachedMenuWindows;
+    }
+
+    NSArray<FWWindowInfo *> *windows = [FWWindowLister allWindows];
+    self.cachedMenuWindows = windows;
+    self.cachedMenuWindowsDate = [NSDate date];
+    return windows;
+}
+
+- (void)invalidateMenuWindowsCache {
+    self.cachedMenuWindows = nil;
+    self.cachedMenuWindowsDate = nil;
+}
+
+- (BOOL)performAutomationCommandOnMainThread:(NSString *)command userInfo:(NSDictionary *)userInfo {
+    if (NSThread.isMainThread) {
+        return [self performAutomationCommand:command userInfo:userInfo];
+    }
+
+    __block BOOL ok = NO;
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        ok = [self performAutomationCommand:command userInfo:userInfo];
+    });
+    return ok;
+}
+
 - (void)rebuildMenu {
     NSMenu *menu = [NSMenu new];
+    BOOL hasScreenCaptureAccess = CGPreflightScreenCaptureAccess();
 
     NSMenuItem *titleItem = [[NSMenuItem alloc] initWithTitle:@"FlowWin" action:nil keyEquivalent:@""];
     titleItem.enabled = NO;
@@ -445,7 +520,7 @@ static OSStatus FWHandleHotKey(EventHandlerCallRef nextHandler, EventRef event, 
         [menu addItem:settingsItem];
     }
 
-    if (CGPreflightScreenCaptureAccess()) {
+    if (hasScreenCaptureAccess) {
         NSMenuItem *permissionItem = [[NSMenuItem alloc] initWithTitle:@"屏幕录制：已允许" action:nil keyEquivalent:@""];
         permissionItem.enabled = NO;
         [menu addItem:permissionItem];
@@ -495,24 +570,26 @@ static OSStatus FWHandleHotKey(EventHandlerCallRef nextHandler, EventRef event, 
 
     NSMenuItem *pinItem = [[NSMenuItem alloc] initWithTitle:@"固定窗口" action:nil keyEquivalent:@""];
     NSMenu *pinMenu = [NSMenu new];
-    NSArray<FWWindowInfo *> *windows = [FWWindowLister allWindows];
-    if (!CGPreflightScreenCaptureAccess()) {
+    if (!hasScreenCaptureAccess) {
         NSMenuItem *emptyItem = [[NSMenuItem alloc] initWithTitle:@"需要屏幕录制权限" action:nil keyEquivalent:@""];
         emptyItem.enabled = NO;
         [pinMenu addItem:emptyItem];
-    } else if (windows.count == 0) {
-        NSMenuItem *emptyItem = [[NSMenuItem alloc] initWithTitle:@"没有找到窗口" action:nil keyEquivalent:@""];
-        emptyItem.enabled = NO;
-        [pinMenu addItem:emptyItem];
     } else {
-        for (FWWindowInfo *windowInfo in windows) {
-            NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:windowInfo.displayName
-                                                          action:@selector(pinWindow:)
-                                                   keyEquivalent:@""];
-            item.target = self;
-            item.representedObject = windowInfo;
-            item.state = self.mirrors[@(windowInfo.windowID)] ? NSControlStateValueOn : NSControlStateValueOff;
-            [pinMenu addItem:item];
+        NSArray<FWWindowInfo *> *windows = [self menuWindowsRefreshing:NO];
+        if (windows.count == 0) {
+            NSMenuItem *emptyItem = [[NSMenuItem alloc] initWithTitle:@"没有找到窗口" action:nil keyEquivalent:@""];
+            emptyItem.enabled = NO;
+            [pinMenu addItem:emptyItem];
+        } else {
+            for (FWWindowInfo *windowInfo in windows) {
+                NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:windowInfo.displayName
+                                                              action:@selector(pinWindow:)
+                                                       keyEquivalent:@""];
+                item.target = self;
+                item.representedObject = windowInfo;
+                item.state = self.mirrors[@(windowInfo.windowID)] ? NSControlStateValueOn : NSControlStateValueOff;
+                [pinMenu addItem:item];
+            }
         }
     }
     pinItem.submenu = pinMenu;
@@ -638,18 +715,21 @@ static OSStatus FWHandleHotKey(EventHandlerCallRef nextHandler, EventRef event, 
 
 - (void)refreshMenu:(NSMenuItem *)sender {
     (void)sender;
+    [self invalidateMenuWindowsCache];
     [self rebuildMenu];
 }
 
 - (void)requestScreenCapturePermission:(NSMenuItem *)sender {
     (void)sender;
     CGRequestScreenCaptureAccess();
+    [self invalidateMenuWindowsCache];
     [self rebuildMenu];
 }
 
 - (void)requestAccessibilityPermission:(NSMenuItem *)sender {
     (void)sender;
     FWAccessibilityTrusted(YES);
+    [self invalidateMenuWindowsCache];
     [self rebuildMenu];
 }
 
@@ -711,6 +791,7 @@ static OSStatus FWHandleHotKey(EventHandlerCallRef nextHandler, EventRef event, 
     }
 
     if ([command isEqualToString:FWAutomationRefreshMenuCommand] || [command isEqualToString:@"refresh"]) {
+        [self invalidateMenuWindowsCache];
         [self rebuildMenu];
         return YES;
     }
@@ -824,6 +905,7 @@ static OSStatus FWHandleHotKey(EventHandlerCallRef nextHandler, EventRef event, 
     mirror.delegate = self;
     [mirror setMirrorOpacity:self.globalOpacity];
     self.mirrors[key] = mirror;
+    [self mirrorCollectionDidChange];
     [self updateModifierOperateStateFromFlags:NSEvent.modifierFlags];
 }
 
@@ -832,6 +914,7 @@ static OSStatus FWHandleHotKey(EventHandlerCallRef nextHandler, EventRef event, 
     FWMirrorController *mirror = self.mirrors[key];
     [mirror stop];
     [self.mirrors removeObjectForKey:key];
+    [self mirrorCollectionDidChange];
 }
 
 - (void)toggleFrontmostWindow:(id)sender {
@@ -856,6 +939,7 @@ static OSStatus FWHandleHotKey(EventHandlerCallRef nextHandler, EventRef event, 
 
     [mirror stop];
     [self.mirrors removeObjectForKey:key];
+    [self mirrorCollectionDidChange];
     [self rebuildMenu];
 }
 
@@ -867,6 +951,7 @@ static OSStatus FWHandleHotKey(EventHandlerCallRef nextHandler, EventRef event, 
 
     [mirror stop];
     [self.mirrors removeObjectForKey:key];
+    [self mirrorCollectionDidChange];
     [self rebuildMenu];
 }
 
@@ -956,6 +1041,7 @@ static OSStatus FWHandleHotKey(EventHandlerCallRef nextHandler, EventRef event, 
     FWMirrorController *mirror = self.mirrors[key];
     [mirror stop];
     [self.mirrors removeObjectForKey:key];
+    [self mirrorCollectionDidChange];
     [self rebuildMenu];
 }
 
@@ -965,6 +1051,7 @@ static OSStatus FWHandleHotKey(EventHandlerCallRef nextHandler, EventRef event, 
         [mirror stop];
     }
     [self.mirrors removeAllObjects];
+    [self mirrorCollectionDidChange];
     [self rebuildMenu];
 }
 
